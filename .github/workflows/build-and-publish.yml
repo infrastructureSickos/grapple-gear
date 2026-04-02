@@ -1,0 +1,88 @@
+name: Build and Publish
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+
+      - name: Build
+        run: ./gradlew build
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: grapple-gear-jar
+          path: build/libs/*.jar
+          if-no-files-found: error
+
+      - name: Publish to Modrinth
+        env:
+          MODRINTH_API_TOKEN: ${{ secrets.MODRINTH_API_TOKEN }}
+        run: ./gradlew modrinth
+
+      - name: Update modpack manifest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          MOD_VERSION=$(grep '^mod_version=' gradle.properties | cut -d'=' -f2)
+          MODRINTH_ID=$(grep '^modrinth_id=' gradle.properties | cut -d'=' -f2)
+
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/brooswit/minecraft-modpack.git" modpack-repo
+          cd modpack-repo
+
+          python3 - "$MODRINTH_ID" "$MOD_VERSION" <<'EOF'
+          import json, sys, os
+
+          modrinth_id = sys.argv[1]
+          mod_version = sys.argv[2]
+          manifest_path = 'manifest.json'
+
+          if not os.path.exists(manifest_path):
+              print(f"manifest.json not found, skipping update")
+              sys.exit(0)
+
+          with open(manifest_path, 'r') as f:
+              manifest = json.load(f)
+
+          updated = False
+          for mod in manifest.get('files', []):
+              if mod.get('projectID') == modrinth_id or mod.get('modrinth_id') == modrinth_id:
+                  mod['version'] = mod_version
+                  updated = True
+                  break
+
+          if not updated:
+              print(f"grapple-gear ({modrinth_id}) not found in manifest, skipping update")
+              sys.exit(0)
+
+          with open(manifest_path, 'w') as f:
+              json.dump(manifest, f, indent=2)
+              f.write('\n')
+
+          print(f"Updated grapple-gear to version {mod_version}")
+          EOF
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          if git diff --quiet; then
+            echo "No changes to commit in modpack manifest"
+          else
+            git add manifest.json
+            git commit -m "chore: bump grapple-gear to v${MOD_VERSION}"
+            git push
+          fi

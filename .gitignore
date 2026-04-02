@@ -1,0 +1,18 @@
+# Build output
+build/
+out/
+
+# Gradle
+.gradle/
+!gradle/wrapper/gradle-wrapper.jar
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# Forge run dirs
+run/
+
+# Generated resources
+src/generated/
