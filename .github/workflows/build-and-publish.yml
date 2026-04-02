@@ -3,12 +3,24 @@ name: Build and Publish
 on:
   push:
     branches: [ main ]
+    tags:
+      - 'v*'
 
 jobs:
-  build-and-publish:
+  build:
     runs-on: ubuntu-latest
+    outputs:
+      mod_version: ${{ steps.props.outputs.mod_version }}
+      jar_name: ${{ steps.build.outputs.jar_name }}
+
     steps:
       - uses: actions/checkout@v4
+
+      - name: Read mod version
+        id: props
+        run: |
+          MOD_VERSION=$(grep '^mod_version=' gradle.properties | cut -d= -f2)
+          echo "mod_version=${MOD_VERSION}" >> "$GITHUB_OUTPUT"
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -19,70 +31,131 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v3
 
-      - name: Build
-        run: ./gradlew build
+      - name: Build jar
+        id: build
+        run: |
+          ./gradlew build
+          JAR_NAME=$(ls build/libs/grapple-gear-*.jar | grep -v sources | head -1 | xargs basename)
+          echo "jar_name=${JAR_NAME}" >> "$GITHUB_OUTPUT"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: grapple-gear-jar
-          path: build/libs/*.jar
+          path: build/libs/grapple-gear-${{ steps.props.outputs.mod_version }}.jar
           if-no-files-found: error
 
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    outputs:
+      modrinth_version_id: ${{ steps.publish.outputs.modrinth_version_id }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download jar artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: grapple-gear-jar
+          path: build/libs/
+
       - name: Publish to Modrinth
+        id: publish
         env:
           MODRINTH_API_TOKEN: ${{ secrets.MODRINTH_API_TOKEN }}
-        run: ./gradlew modrinth
-
-      - name: Update modpack manifest
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MOD_VERSION: ${{ needs.build.outputs.mod_version }}
         run: |
-          MOD_VERSION=$(grep '^mod_version=' gradle.properties | cut -d'=' -f2)
-          MODRINTH_ID=$(grep '^modrinth_id=' gradle.properties | cut -d'=' -f2)
+          set -euo pipefail
 
-          git clone "https://x-access-token:${GH_TOKEN}@github.com/brooswit/minecraft-modpack.git" modpack-repo
-          cd modpack-repo
+          TAG="${GITHUB_REF_NAME}"
+          JAR_FILE="build/libs/grapple-gear-${MOD_VERSION}.jar"
 
-          python3 - "$MODRINTH_ID" "$MOD_VERSION" <<'EOF'
-          import json, sys, os
+          DATA=$(python3 -c "
+          import json
+          data = {
+              'name': 'GrappleGear ${TAG}',
+              'version_number': '${TAG}',
+              'version_type': 'release',
+              'project_id': '89Eyimnd',
+              'dependencies': [],
+              'game_versions': ['1.20.1'],
+              'loaders': ['forge'],
+              'featured': True,
+              'file_parts': ['jar']
+          }
+          print(json.dumps(data))
+          ")
 
-          modrinth_id = sys.argv[1]
-          mod_version = sys.argv[2]
-          manifest_path = 'manifest.json'
+          RESPONSE=$(curl -sf \
+            -H "Authorization: ${MODRINTH_API_TOKEN}" \
+            -F "data=${DATA}" \
+            -F "jar=@${JAR_FILE};type=application/java-archive" \
+            "https://api.modrinth.com/v2/version")
 
-          if not os.path.exists(manifest_path):
-              print(f"manifest.json not found, skipping update")
-              sys.exit(0)
+          MODRINTH_VERSION_ID=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
+          echo "Published to Modrinth: version_id=${MODRINTH_VERSION_ID}"
+          echo "modrinth_version_id=${MODRINTH_VERSION_ID}" >> "$GITHUB_OUTPUT"
 
-          with open(manifest_path, 'r') as f:
-              manifest = json.load(f)
+  update-modpack:
+    needs: [build, publish]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
 
-          updated = False
-          for mod in manifest.get('files', []):
-              if mod.get('projectID') == modrinth_id or mod.get('modrinth_id') == modrinth_id:
-                  mod['version'] = mod_version
-                  updated = True
+    steps:
+      - name: Checkout server repo
+        uses: actions/checkout@v4
+        with:
+          repository: infrastructureSickos/server
+          token: ${{ secrets.INFRA_BOT_PAT }}
+          path: server
+
+      - name: Update mods-list.json
+        env:
+          MODRINTH_VERSION_ID: ${{ needs.publish.outputs.modrinth_version_id }}
+        run: |
+          set -euo pipefail
+          cd server
+
+          python3 - <<'PYEOF'
+          import json, os, sys
+
+          version_id = os.environ['MODRINTH_VERSION_ID']
+          path = 'mods-list.json'
+
+          with open(path) as f:
+              mods = json.load(f)
+
+          entry_found = False
+          for mod in mods:
+              if mod.get('modrinth_project_id') == '89Eyimnd':
+                  mod['version_id'] = version_id
+                  entry_found = True
                   break
 
-          if not updated:
-              print(f"grapple-gear ({modrinth_id}) not found in manifest, skipping update")
-              sys.exit(0)
+          if not entry_found:
+              mods.append({
+                  'name': 'GrappleGear',
+                  'modrinth_project_id': '89Eyimnd',
+                  'version_id': version_id
+              })
+              print(f'Added new entry for grapple-gear: {version_id}')
+          else:
+              print(f'Updated grapple-gear to version_id: {version_id}')
 
-          with open(manifest_path, 'w') as f:
-              json.dump(manifest, f, indent=2)
+          with open(path, 'w') as f:
+              json.dump(mods, f, indent=2)
               f.write('\n')
+          PYEOF
 
-          print(f"Updated grapple-gear to version {mod_version}")
-          EOF
-
-          git config user.name "github-actions[bot]"
+      - name: Commit and push
+        env:
+          MODRINTH_VERSION_ID: ${{ needs.publish.outputs.modrinth_version_id }}
+        run: |
+          cd server
+          git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          if git diff --quiet; then
-            echo "No changes to commit in modpack manifest"
-          else
-            git add manifest.json
-            git commit -m "chore: bump grapple-gear to v${MOD_VERSION}"
-            git push
-          fi
+          git add mods-list.json
+          git commit -m "chore: update grapple-gear to modrinth version ${MODRINTH_VERSION_ID}"
+          git push
